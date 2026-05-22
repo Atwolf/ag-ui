@@ -460,12 +460,32 @@ class StrandsAgent:
         )
 
         try:
+            # Detect delta-only payloads (where the client sent fewer
+            # messages than the session has — e.g. only the trailing
+            # tool result, or only the new user message in a continued
+            # chat). CopilotKit V2's MESSAGES_SNAPSHOT handler treats
+            # the snapshot as authoritative: any existing client message
+            # whose id is not in the snapshot gets dropped. Emitting a
+            # partial snapshot on a delta payload would wipe prior turns
+            # from the UI. The frontend already has the full history with
+            # the original ids, so we suppress snapshot emission for this
+            # run and let TEXT_MESSAGE_*/TOOL_CALL_* streaming events
+            # reconcile naturally.
+            session_msgs = getattr(strands_agent, "messages", None) or []
+            is_delta_payload = (
+                bool(session_msgs)
+                and len(session_msgs) > len(input_data.messages or [])
+            )
+            emit_snapshots = (
+                self.config.emit_messages_snapshot and not is_delta_payload
+            )
+
             # Seed the running ``MessagesSnapshotEvent`` payload from the
             # full conversation history sent by the client. Each emitted
             # snapshot then carries prior turns + whatever this turn adds.
             snapshot_messages: List[Any] = (
                 _build_snapshot_messages(input_data.messages)
-                if self.config.emit_messages_snapshot
+                if emit_snapshots
                 else []
             )
 
@@ -484,7 +504,7 @@ class StrandsAgent:
             # after ``RunStartedEvent`` / ``StateSnapshotEvent`` so the
             # frontend can render the seeded thread before any new content
             # streams in.
-            if self.config.emit_messages_snapshot and snapshot_messages:
+            if emit_snapshots and snapshot_messages:
                 yield MessagesSnapshotEvent(
                     type=EventType.MESSAGES_SNAPSHOT,
                     messages=list(snapshot_messages),
@@ -984,7 +1004,7 @@ class StrandsAgent:
                             # running snapshot so the frontend can pair
                             # call + result in the message tree.
                             if (
-                                self.config.emit_messages_snapshot
+                                emit_snapshots
                                 and not (
                                     behavior
                                     and behavior.skip_messages_snapshot
@@ -1055,7 +1075,7 @@ class StrandsAgent:
                                     # variant): commit any accumulated
                                     # assistant text into the snapshot.
                                     if (
-                                        self.config.emit_messages_snapshot
+                                        emit_snapshots
                                         and accumulated_text
                                     ):
                                         snapshot_messages.append(
@@ -1179,7 +1199,7 @@ class StrandsAgent:
                                         message_id=message_id,
                                     )
                                     if (
-                                        self.config.emit_messages_snapshot
+                                        emit_snapshots
                                         and accumulated_text
                                     ):
                                         snapshot_messages.append(
@@ -1352,7 +1372,7 @@ class StrandsAgent:
                                     )
 
                                     if (
-                                        self.config.emit_messages_snapshot
+                                        emit_snapshots
                                         and not (
                                             behavior
                                             and behavior.skip_messages_snapshot
@@ -1456,7 +1476,7 @@ class StrandsAgent:
                                             type=EventType.TEXT_MESSAGE_END, message_id=message_id
                                         )
                                         if (
-                                            self.config.emit_messages_snapshot
+                                            emit_snapshots
                                             and accumulated_text
                                         ):
                                             snapshot_messages.append(
@@ -1508,7 +1528,7 @@ class StrandsAgent:
                                     )
 
                                     if (
-                                        self.config.emit_messages_snapshot
+                                        emit_snapshots
                                         and not (
                                             behavior
                                             and behavior.skip_messages_snapshot
@@ -1602,7 +1622,7 @@ class StrandsAgent:
                 # Splice point 4 of 4 (terminal): commit the final
                 # assistant text turn into the snapshot so the frontend
                 # has the closing message in canonical history.
-                if self.config.emit_messages_snapshot and accumulated_text:
+                if emit_snapshots and accumulated_text:
                     snapshot_messages.append(
                         AssistantMessage(
                             id=message_id,
