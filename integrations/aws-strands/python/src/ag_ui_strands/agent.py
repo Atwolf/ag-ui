@@ -707,6 +707,7 @@ class StrandsAgent:
             replay_history = (
                 self.config.replay_history_into_strands
                 and getattr(strands_agent, "session_manager", None) is None
+                and getattr(strands_agent, "_session_manager", None) is None
             )
             if replay_history:
                 native_history = _build_strands_history(input_data.messages)
