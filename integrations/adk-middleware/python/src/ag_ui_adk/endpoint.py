@@ -5,7 +5,7 @@
 import logging
 import uuid
 import warnings
-from typing import Any, Callable, Coroutine, List, Optional
+from typing import Any, Awaitable, Callable, Coroutine, List, Optional
 
 from ag_ui.core import EventType, RunAgentInput, RunErrorEvent
 from ag_ui.encoder import EventEncoder
@@ -30,6 +30,8 @@ from .event_translator import adk_events_to_messages
 
 logger = logging.getLogger(__name__)
 
+AgentResolver = Callable[[Request, RunAgentInput], Awaitable[ADKAgent | None]]
+
 
 def _build_run_error(message: str, code: str) -> RunErrorEvent:
     """Construct a ``RunErrorEvent`` with the given message and code.
@@ -39,6 +41,140 @@ def _build_run_error(message: str, code: str) -> RunErrorEvent:
     drive the error-encoding fallback path directly.
     """
     return RunErrorEvent(type=EventType.RUN_ERROR, message=message, code=code)
+
+
+class AgentResolutionError(Exception):
+    """Raised when multi-agent routing cannot be resolved deterministically."""
+
+
+async def _merge_extractor_state(
+    input_data: RunAgentInput,
+    request: Request,
+    extract_state_fn: Optional[
+        Callable[[Request, RunAgentInput], Coroutine[dict[str, Any], Any, Any]]
+    ],
+) -> RunAgentInput:
+    """Run the request extractor and merge returned state over input state."""
+    if not extract_state_fn:
+        return input_data
+
+    extracted_state_dict = await extract_state_fn(request, input_data)
+    if not extracted_state_dict:
+        return input_data
+
+    existing_state = input_data.state if isinstance(input_data.state, dict) else {}
+    merged_state = {**existing_state, **extracted_state_dict}
+    return input_data.model_copy(update={"state": merged_state})
+
+
+def _tool_result_ids(input_data: RunAgentInput) -> list[str]:
+    """Return tool result IDs from the trailing tool-result message suffix."""
+    tool_call_ids = []
+    for message in reversed(input_data.messages):
+        if getattr(message, "role", None) == "tool":
+            tool_call_id = getattr(message, "tool_call_id", None)
+            if tool_call_id:
+                tool_call_ids.append(tool_call_id)
+            continue
+        break
+    return list(reversed(tool_call_ids))
+
+
+def _resolve_pinned_agent(
+    input_data: RunAgentInput,
+    tool_call_agent_pins: dict[tuple[str, str], ADKAgent],
+) -> Optional[ADKAgent]:
+    """Resolve a tool-result continuation from in-process routing pins."""
+    tool_call_ids = _tool_result_ids(input_data)
+    if not tool_call_ids:
+        return None
+
+    selected_agents = []
+    missing_tool_call_ids = []
+    for tool_call_id in tool_call_ids:
+        pinned_agent = tool_call_agent_pins.get((input_data.thread_id, tool_call_id))
+        if pinned_agent is None:
+            missing_tool_call_ids.append(tool_call_id)
+        else:
+            selected_agents.append(pinned_agent)
+
+    if missing_tool_call_ids:
+        raise AgentResolutionError(
+            "Cannot route tool result without an in-process agent pin "
+            f"for tool_call_id(s): {', '.join(missing_tool_call_ids)}"
+        )
+
+    pinned_agent_ids = {id(pinned_agent) for pinned_agent in selected_agents}
+    if len(pinned_agent_ids) != 1:
+        raise AgentResolutionError(
+            "Cannot route tool results with mixed in-process agent pins"
+        )
+
+    return selected_agents[0]
+
+
+async def _select_agent(
+    default_agent: ADKAgent,
+    input_data: RunAgentInput,
+    request: Request,
+    agent_resolver: Optional[AgentResolver],
+    tool_call_agent_pins: dict[tuple[str, str], ADKAgent],
+) -> ADKAgent:
+    """Select the agent after extractor merge and before transport framing."""
+    pinned_agent = _resolve_pinned_agent(input_data, tool_call_agent_pins)
+    if pinned_agent is not None:
+        return pinned_agent
+
+    if agent_resolver is None:
+        return default_agent
+
+    resolved_agent = await agent_resolver(request, input_data)
+    if resolved_agent is None:
+        return default_agent
+    if not isinstance(resolved_agent, ADKAgent):
+        raise AgentResolutionError(
+            "agent_resolver must return an ADKAgent instance or None"
+        )
+    return resolved_agent
+
+
+async def _stream_agent_events(
+    agent: "ADKAgent",
+    input_data: RunAgentInput,
+    tool_call_agent_pins: dict[tuple[str, str], ADKAgent],
+):
+    """Yield agent events while maintaining in-process tool-call routing pins."""
+    started_tool_call_ids: list[str] = []
+    cleanup_terminal_pins = False
+    try:
+        async for event in agent.run(input_data):
+            event_type = getattr(event, "type", None)
+            tool_call_id = getattr(event, "tool_call_id", None)
+            if event_type == EventType.TOOL_CALL_START and tool_call_id:
+                tool_call_agent_pins[(input_data.thread_id, tool_call_id)] = agent
+                started_tool_call_ids.append(tool_call_id)
+            elif event_type == EventType.TOOL_CALL_RESULT and tool_call_id:
+                tool_call_agent_pins.pop((input_data.thread_id, tool_call_id), None)
+                if tool_call_id in started_tool_call_ids:
+                    started_tool_call_ids.remove(tool_call_id)
+            elif event_type == EventType.RUN_ERROR:
+                cleanup_terminal_pins = True
+            elif event_type == EventType.RUN_FINISHED:
+                outcome = getattr(event, "outcome", None)
+                cleanup_terminal_pins = (
+                    outcome is None or getattr(outcome, "type", None) == "success"
+                )
+            yield event
+    except BaseException:
+        cleanup_terminal_pins = True
+        raise
+    finally:
+        if not cleanup_terminal_pins:
+            return
+        for tool_call_id in started_tool_call_ids:
+            key = (input_data.thread_id, tool_call_id)
+            if tool_call_agent_pins.get(key) is agent:
+                tool_call_agent_pins.pop(key, None)
 
 
 def _sse_event(raw_data: str, *, event: Optional[str] = None) -> ServerSentEvent:
@@ -56,7 +192,11 @@ def _sse_event(raw_data: str, *, event: Optional[str] = None) -> ServerSentEvent
     return ServerSentEvent(data=raw_data, event=event, sep="\n")
 
 
-async def _sse_stream(agent: "ADKAgent", input_data: RunAgentInput):
+async def _sse_stream(
+    agent: "ADKAgent",
+    input_data: RunAgentInput,
+    tool_call_agent_pins: dict[tuple[str, str], ADKAgent],
+):
     """Yield ``ServerSentEvent``s for an SSE consumer.
 
     Wire format is byte-identical to the pre-PR ``EventEncoder`` output: each
@@ -66,7 +206,7 @@ async def _sse_stream(agent: "ADKAgent", input_data: RunAgentInput):
     always sees a structured stream tail.
     """
     try:
-        async for event in agent.run(input_data):
+        async for event in _stream_agent_events(agent, input_data, tool_call_agent_pins):
             try:
                 encoded = event.model_dump_json(by_alias=True, exclude_none=True)
                 logger.debug(f"HTTP Response: {encoded}")
@@ -107,7 +247,10 @@ async def _sse_stream(agent: "ADKAgent", input_data: RunAgentInput):
 
 
 async def _legacy_stream(
-    agent: "ADKAgent", input_data: RunAgentInput, encoder: EventEncoder
+    agent: "ADKAgent",
+    input_data: RunAgentInput,
+    encoder: EventEncoder,
+    tool_call_agent_pins: dict[tuple[str, str], ADKAgent],
 ):
     """Yield encoded byte-strings for a non-SSE ``StreamingResponse`` consumer.
 
@@ -119,7 +262,7 @@ async def _legacy_stream(
     encoder later doesn't require a separate endpoint change.
     """
     try:
-        async for event in agent.run(input_data):
+        async for event in _stream_agent_events(agent, input_data, tool_call_agent_pins):
             try:
                 encoded = encoder.encode(event)
                 logger.debug(f"HTTP Response: {encoded}")
@@ -151,6 +294,24 @@ async def _legacy_stream(
         except Exception:
             logger.error("Failed to encode agent error event, yielding basic SSE error")
             yield 'data: {"error": "Agent execution failed"}\n\n'
+
+
+async def _sse_run_error_stream(error_event: RunErrorEvent):
+    """Yield a single ``RunErrorEvent`` using SSE framing."""
+    try:
+        yield _sse_event(error_event.model_dump_json(by_alias=True, exclude_none=True))
+    except Exception:
+        logger.error("Failed to encode routing error event, yielding basic SSE error")
+        yield _sse_event('{"error": "Agent routing failed"}', event="error")
+
+
+async def _legacy_run_error_stream(error_event: RunErrorEvent, encoder: EventEncoder):
+    """Yield a single ``RunErrorEvent`` using the legacy encoder."""
+    try:
+        yield encoder.encode(error_event)
+    except Exception:
+        logger.error("Failed to encode routing error event, yielding basic SSE error")
+        yield 'data: {"error": "Agent routing failed"}\n\n'
 
 
 class AgentStateRequest(BaseModel):
@@ -230,6 +391,7 @@ def add_adk_fastapi_endpoint(
     path: str = "/",
     extract_headers: Optional[List[str]] = None,
     extract_state_from_request: Optional[Callable[[Request, RunAgentInput], Coroutine[dict[str,Any], Any, Any]]] = None,
+    agent_resolver: Optional[AgentResolver] = None,
 ):
     """Add ADK middleware endpoint to FastAPI app.
 
@@ -242,11 +404,19 @@ def add_adk_fastapi_endpoint(
             State values returned from this function will override any existing state values. 
             The RunAgentInput is provided so conflicts can be identified and resolved appropriately.
             Cannot be used with extract_headers.
+        agent_resolver: Optional async function that can select an ``ADKAgent``
+            for the request after state extraction. Returning ``None`` uses
+            the default agent.
 
     Note:
         This function also adds an experimental POST /agents/state endpoint for
         consumption by front-end frameworks that need to retrieve thread state and
         message history. This endpoint is subject to change in future versions.
+        When ``agent_resolver`` is configured, routing is applied to the run
+        endpoint, ``/capabilities``, and ``/agents/state`` after request state
+        extraction. Tool-result submissions are pinned in-process to the agent
+        that emitted the matching tool call; missing or mixed pins fail closed
+        with a ``RUN_ERROR`` instead of invoking the resolver.
     """
     extract_state_fn = extract_state_from_request
     if extract_headers is not None:
@@ -260,6 +430,8 @@ def add_adk_fastapi_endpoint(
             extract_state_fn = make_extract_headers(extract_headers)
         else:
             raise ValueError("Cannot use both 'extract_headers' and 'extract_state_from_request' parameters together.")
+
+    tool_call_agent_pins: dict[tuple[str, str], ADKAgent] = {}
 
     @app.post(path)
     async def adk_endpoint(input_data: RunAgentInput, request: Request):
@@ -280,15 +452,6 @@ def add_adk_fastapi_endpoint(
           continue to work without keep-alive pings (which are SSE-specific).
         """
 
-        # Extract headers into state.headers if list provided
-        if extract_state_fn:
-            extracted_state_dict = await extract_state_fn(request, input_data)
-
-            if extracted_state_dict:
-                existing_state = input_data.state if isinstance(input_data.state, dict) else {}
-                merged_state = {**existing_state, **extracted_state_dict}
-                input_data = input_data.model_copy(update={"state": merged_state})
-
         # ``EventEncoder`` types ``accept`` as ``str`` (not ``Optional[str]``);
         # pass an empty string when the client didn't send an ``Accept`` header
         # so we still hit the default ``text/event-stream`` content type.
@@ -296,25 +459,68 @@ def add_adk_fastapi_endpoint(
         encoder = EventEncoder(accept=accept_header)
         content_type = encoder.get_content_type()
 
+        try:
+            input_data = await _merge_extractor_state(
+                input_data, request, extract_state_fn
+            )
+            selected_agent = await _select_agent(
+                agent, input_data, request, agent_resolver, tool_call_agent_pins
+            )
+        except Exception as e:
+            logger.error(f"Error selecting ADKAgent: {e}", exc_info=True)
+            error_event = _build_run_error(
+                message=f"Agent routing failed: {str(e)}",
+                code="AGENT_ROUTING_ERROR",
+            )
+            if content_type == "text/event-stream":
+                return EventSourceResponse(_sse_run_error_stream(error_event))
+            return StreamingResponse(
+                _legacy_run_error_stream(error_event, encoder),
+                media_type=content_type,
+            )
+
         if content_type == "text/event-stream":
-            return EventSourceResponse(_sse_stream(agent, input_data))
+            return EventSourceResponse(
+                _sse_stream(selected_agent, input_data, tool_call_agent_pins)
+            )
         return StreamingResponse(
-            _legacy_stream(agent, input_data, encoder),
+            _legacy_stream(selected_agent, input_data, encoder, tool_call_agent_pins),
             media_type=content_type,
         )
 
     capabilities_path = f"{path.rstrip('/')}/capabilities" if path != "/" else "/capabilities"
 
     @app.get(capabilities_path)
-    async def capabilities_endpoint():
+    async def capabilities_endpoint(request: Request):
         """Return the agent's declared capabilities.
 
         Allows frontend clients to discover what features the agent supports
         before initiating a run (e.g., predictive chips, suggested questions).
-        Returns an empty object when no capabilities are configured.
+        The request extractor and resolver are applied with a fixed synthetic
+        input so selection only depends on request/extractor context. Returns
+        an empty object when no capabilities are configured.
         """
         try:
-            caps = agent.get_capabilities()
+            synthetic_input = RunAgentInput(
+                thread_id="capabilities",
+                run_id="capabilities",
+                state={},
+                messages=[],
+                tools=[],
+                context=[],
+                forwarded_props=None,
+            )
+            synthetic_input = await _merge_extractor_state(
+                synthetic_input, request, extract_state_fn
+            )
+            selected_agent = await _select_agent(
+                agent,
+                synthetic_input,
+                request,
+                agent_resolver,
+                tool_call_agent_pins,
+            )
+            caps = selected_agent.get_capabilities()
             if caps is None:
                 logger.debug("Capabilities endpoint called but no capabilities configured on agent")
                 return JSONResponse(content={})
@@ -367,11 +573,17 @@ def add_adk_fastapi_endpoint(
             )
 
             if extract_state_fn:
-                extracted_state_dict = await extract_state_fn(request, synthetic_input)
-                if extracted_state_dict:
-                    synthetic_input = synthetic_input.model_copy(
-                        update={"state": extracted_state_dict}
-                    )
+                synthetic_input = await _merge_extractor_state(
+                    synthetic_input, request, extract_state_fn
+                )
+
+            selected_agent = await _select_agent(
+                agent,
+                synthetic_input,
+                request,
+                agent_resolver,
+                tool_call_agent_pins,
+            )
 
             extractor_state = (
                 synthetic_input.state if isinstance(synthetic_input.state, dict) else {}
@@ -383,19 +595,19 @@ def add_adk_fastapi_endpoint(
             #   3. state["app_name"] / state["user_id"] written by extract_state_fn
             #      (so JWT-style hooks work without also wiring an ADKAgent extractor)
             #   4. Body field (deprecated when an extractor is configured)
-            if agent._static_app_name:
-                app_name = agent._static_app_name
-            elif getattr(agent, "_app_name_extractor", None):
-                app_name = agent._app_name_extractor(synthetic_input)
+            if selected_agent._static_app_name:
+                app_name = selected_agent._static_app_name
+            elif getattr(selected_agent, "_app_name_extractor", None):
+                app_name = selected_agent._app_name_extractor(synthetic_input)
             elif "app_name" in extractor_state:
                 app_name = extractor_state["app_name"]
             else:
                 app_name = request_data.appName
 
-            if agent._static_user_id:
-                user_id = agent._static_user_id
-            elif getattr(agent, "_user_id_extractor", None):
-                user_id = agent._user_id_extractor(synthetic_input)
+            if selected_agent._static_user_id:
+                user_id = selected_agent._static_user_id
+            elif getattr(selected_agent, "_user_id_extractor", None):
+                user_id = selected_agent._user_id_extractor(synthetic_input)
             elif "user_id" in extractor_state:
                 user_id = extractor_state["user_id"]
             else:
@@ -425,10 +637,10 @@ def add_adk_fastapi_endpoint(
             session_id = None
 
             # Fast path: check cache first
-            metadata = agent._get_session_metadata(thread_id, user_id)
+            metadata = selected_agent._get_session_metadata(thread_id, user_id)
             if metadata:
                 session_id, cached_app_name, cached_user_id = metadata
-                session = await agent._session_manager._session_service.get_session(
+                session = await selected_agent._session_manager._session_service.get_session(
                     session_id=session_id,
                     app_name=cached_app_name,
                     user_id=cached_user_id
@@ -440,18 +652,18 @@ def add_adk_fastapi_endpoint(
             # Cache miss - search backend by thread_id
             if not session:
                 # O(1) direct lookup when use_thread_id_as_session_id is enabled
-                if getattr(agent._session_manager, '_use_thread_id_as_session_id', False) is True:
-                    session = await agent._session_manager.get_session(
+                if getattr(selected_agent._session_manager, '_use_thread_id_as_session_id', False) is True:
+                    session = await selected_agent._session_manager.get_session(
                         thread_id, app_name, user_id
                     )
                     if session:
                         session_id = session.id
-                        agent._session_lookup_cache[(thread_id, user_id)] = (session_id, app_name, user_id)
+                        selected_agent._session_lookup_cache[(thread_id, user_id)] = (session_id, app_name, user_id)
 
                 # Fallback to O(n) scan (always used when flag is False,
                 # also used as legacy fallback when flag is True but direct lookup misses)
                 if not session:
-                    session = await agent._session_manager._find_session_by_thread_id(
+                    session = await selected_agent._session_manager._find_session_by_thread_id(
                         app_name=app_name,
                         user_id=user_id,
                         thread_id=thread_id
@@ -459,10 +671,10 @@ def add_adk_fastapi_endpoint(
                     if session:
                         # Found - cache for future lookups
                         session_id = session.id
-                        agent._session_lookup_cache[(thread_id, user_id)] = (session_id, app_name, user_id)
+                        selected_agent._session_lookup_cache[(thread_id, user_id)] = (session_id, app_name, user_id)
 
                         # Reload session to populate events (list_sessions returns metadata only)
-                        session = await agent._session_manager._session_service.get_session(
+                        session = await selected_agent._session_manager._session_service.get_session(
                             session_id=session_id,
                             app_name=app_name,
                             user_id=user_id
@@ -473,7 +685,7 @@ def add_adk_fastapi_endpoint(
             # Get state
             state = {}
             if thread_exists:
-                state = await agent._session_manager.get_session_state(
+                state = await selected_agent._session_manager.get_session_state(
                     session_id=session_id,
                     app_name=app_name,
                     user_id=user_id
@@ -513,6 +725,7 @@ def create_adk_app(
     path: str = "/",
     extract_headers: Optional[List[str]] = None,
     extract_state_from_request: Optional[Callable[[Request, RunAgentInput], Coroutine[dict[str,Any], Any, Any]]] = None,
+    agent_resolver: Optional[AgentResolver] = None,
 ) -> FastAPI:
     """Create a FastAPI app with ADK middleware endpoint.
 
@@ -524,10 +737,20 @@ def create_adk_app(
             State values returned from this function will override any existing state values. 
             The RunAgentInput is provided so conflicts can be identified and resolved appropriately.
             Cannot be used with extract_headers.
+        agent_resolver: Optional async function that can select an ``ADKAgent``
+            for the request after state extraction. Returning ``None`` uses
+            the default agent.
 
     Returns:
         FastAPI application instance
     """
     app = FastAPI(title="ADK Middleware for AG-UI Protocol")
-    add_adk_fastapi_endpoint(app, agent, path, extract_headers=extract_headers, extract_state_from_request=extract_state_from_request)
+    add_adk_fastapi_endpoint(
+        app,
+        agent,
+        path,
+        extract_headers=extract_headers,
+        extract_state_from_request=extract_state_from_request,
+        agent_resolver=agent_resolver,
+    )
     return app
